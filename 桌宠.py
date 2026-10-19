@@ -5,6 +5,8 @@
 聊天时只禁用移动，呼吸/摇摆/小动作正常
 """
 import ctypes
+from ctypes import wintypes
+import datetime
 import psutil
 import json
 import math
@@ -21,7 +23,8 @@ def load_config():
     except Exception as e:
         print("配置读取失败:", e)
         return {
-            "city": "汕头"
+            "city": DEFAULT_CITY,
+            "city_query": CITY_MAP.get(DEFAULT_CITY, DEFAULT_CITY)
         }
 
 try:
@@ -44,6 +47,8 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
 # ===== DeepSeek 配置 =====
 DS_BASE_URL = "https://api.deepseek.com/v1"
 DS_MODEL = "deepseek-chat"
+# API Key 不写死在源码里，按顺序从：①系统环境变量 ②同目录 .env 文件 ③config.json 读取
+DS_KEY_ENV = "DEEPSEEK_API_KEY"
 DS_SYSTEM = "你是桌面宠物大肥鱼，贱兮兮但可爱，每句话不超过25字，偶尔吐槽主人但别真骂人。"
 
 if getattr(sys, "frozen", False):
@@ -56,6 +61,25 @@ else:
     PYTHONW = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
 SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+
+# ===== 城市与天气 =====
+# wttr.in 查询用英文名；这里存一份常用中文城市 → 英文查询名的映射
+DEFAULT_CITY = "石家庄"
+CITY_MAP = {
+    "石家庄": "Shijiazhuang",
+    "北京": "Beijing",
+    "上海": "Shanghai",
+    "广州": "Guangzhou",
+    "深圳": "Shenzhen",
+    "杭州": "Hangzhou",
+    "南京": "Nanjing",
+    "成都": "Chengdu",
+    "重庆": "Chongqing",
+    "武汉": "Wuhan",
+    "西安": "Xian",
+    "天津": "Tianjin",
+    "汕头": "Shantou",
+}
 
 BUBBLE_H = 56
 MARGIN = 4
@@ -108,6 +132,59 @@ FOOD_LINES = {
 FOODS = ["🐟", "🍰", "🍭", "🍡", "💎"]
 
 
+# ===== 心情值 =====
+MOOD_DEFAULT = 70
+MOOD_MAX = 100
+MOOD_MIN = 0
+MOOD_TICK_MS = 60000          # 每 60 秒结算一次心情
+MOOD_IDLE_PENALTY = 2         # 长时间没互动每次扣 2 点
+MOOD_IDLE_MS = 5 * 60 * 1000  # 超过 5 分钟没互动开始扣
+# 喂食 / 聊天 / 互动 加成
+MOOD_FOOD_BONUS = 8
+MOOD_CHAT_BONUS = 3
+MOOD_PET_BONUS = 1            # 拖拽/点击
+# 心情分级（≥ 阈值 时使用该档台词）
+MOOD_LEVELS = [
+    (85, "嗨到不行", "主人最棒了！", LINES, REACT_LINES),
+    (60, "心情不错", "嘿，今天天气不错～", LINES, REACT_LINES),
+    (35, "有点委屈", "你多久没理我了…", INNER_LINES, REACT_LINES),
+    (0,  "非常生气", "哼！你根本不在乎我！", INNER_LINES, REACT_LINES),
+]
+MOOD_STATUS_LINES = {
+    85: "心情极佳！大肥鱼今天很开心～",
+    60: "心情还不错，可以摸一摸",
+    35: "有点委屈，主人多陪陪我",
+    0:  "已经生气啦！快哄我！",
+}
+
+# ===== 番茄钟 / 喝水 / 整点报时 =====
+POMODORO_WORK_MIN = 25
+POMODORO_BREAK_MIN = 5
+DRINK_INTERVAL_MIN = 60  # 喝水提醒间隔
+
+DRINK_LINES = [
+    "主人，喝口水吧～",
+    "记得喝水，别等到口干",
+    "鱼都知道喝水，你呢？",
+    "咕咚咕咚，你也来一口？",
+]
+POMODORO_START_LINES = [
+    "番茄钟启动，专注25分钟！",
+    "开干！不许摸鱼！",
+    "25 分钟倒计时开始，加油！",
+]
+POMODORO_DONE_LINES = [
+    "番茄钟结束！休息 5 分钟！",
+    "叮！时间到，伸个懒腰～",
+    "专注完成！你真棒（小声）",
+]
+POMODORO_BREAK_DONE_LINES = [
+    "休息结束，继续干活！",
+    "回到战场！",
+    "大肥鱼准备好了，你也加油",
+]
+
+
 def load_json(path, default):
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
@@ -125,6 +202,129 @@ def load_json(path, default):
 
     except Exception:
         return default
+
+
+def load_dotenv_file(path):
+    """极简 .env 解析：不引入 python-dotenv 依赖。
+    返回 dict；不修改 os.environ（仅用作降级读取，避免污染进程环境）。"""
+    env = {}
+    if not os.path.exists(path):
+        return env
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k:
+                    env[k] = v
+    except Exception as e:
+        print(".env 读取失败:", e)
+    return env
+
+
+def resolve_api_key(cfg):
+    """按优先级解析 DeepSeek API Key：系统环境变量 > .env 文件 > config.json"""
+    key = os.environ.get(DS_KEY_ENV, "").strip()
+    if key:
+        return key
+    env = load_dotenv_file(os.path.join(APP_DIR, ".env"))
+    key = env.get(DS_KEY_ENV, "").strip()
+    if key:
+        return key
+    return cfg.get("ds_api_key", "").strip()
+
+
+def save_api_key_to_env(key):
+    """把 key 写入 APP_DIR/.env（只覆盖 DEEPSEEK_API_KEY 一行，保留其它变量）"""
+    path = os.path.join(APP_DIR, ".env")
+    lines = []
+    replaced = False
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(".env 读取失败:", e)
+    new_lines = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(f"{DS_KEY_ENV}=") or stripped.startswith(f"{DS_KEY_ENV} ="):
+            new_lines.append(f"{DS_KEY_ENV}={key}\n")
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] = new_lines[-1] + "\n"
+        new_lines.append(f"{DS_KEY_ENV}={key}\n")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        return True
+    except Exception as e:
+        print(".env 写入失败:", e)
+        return False
+
+
+# ===== 心情值辅助 =====
+def clamp_mood(value):
+    return max(MOOD_MIN, min(MOOD_MAX, value))
+
+
+def get_mood_level(mood):
+    """返回 (阈值, 名字, 日常台词池, 回嘴台词池)"""
+    for threshold, name, _status, daily, react in MOOD_LEVELS:
+        if mood >= threshold:
+            return threshold, name, daily, react
+    return MOOD_LEVELS[-1][0], MOOD_LEVELS[-1][1], MOOD_LEVELS[-1][3], MOOD_LEVELS[-1][4]
+
+
+def mood_status_text(mood):
+    if mood >= 85:
+        return MOOD_STATUS_LINES[85]
+    if mood >= 60:
+        return MOOD_STATUS_LINES[60]
+    if mood >= 35:
+        return MOOD_STATUS_LINES[35]
+    return MOOD_STATUS_LINES[0]
+
+
+# ===== 全局快捷键（Windows ctypes） =====
+_HOTKEY_MOD_ALT = 0x0001
+_HOTKEY_MOD_CTRL = 0x0002
+_HOTKEY_MOD = _HOTKEY_MOD_CTRL | _HOTKEY_MOD_ALT
+_HOTKEY_ID_TOGGLE = 1
+_HOTKEY_ID_SPEAK = 2
+_HOTKEY_ID_QUIT = 3
+_HOTKEY_VK = {"toggle": 0x20, "speak": 0x53, "quit": 0x51}  # 空格 / S / Q
+WM_HOTKEY = 0x0312
+
+
+def register_pet_hotkeys(hwnd):
+    user32 = ctypes.windll.user32
+    ok = []
+    for name, vk in _HOTKEY_VK.items():
+        hid = {
+            "toggle": _HOTKEY_ID_TOGGLE,
+            "speak": _HOTKEY_ID_SPEAK,
+            "quit": _HOTKEY_ID_QUIT,
+        }[name]
+        if user32.RegisterHotKey(int(hwnd), int(hid), _HOTKEY_MOD, int(vk)):
+            ok.append(name)
+        else:
+            err = ctypes.get_last_error()
+            print(f"[hotkey] 注册 {name} 失败，错误码 {err}（可能被其他程序占用）")
+    return ok
+
+
+def unregister_pet_hotkeys(hwnd):
+    user32 = ctypes.windll.user32
+    for hid in (_HOTKEY_ID_TOGGLE, _HOTKEY_ID_SPEAK, _HOTKEY_ID_QUIT):
+        user32.UnregisterHotKey(int(hwnd), int(hid))
 
 
 class ChatDialog(QDialog):
@@ -338,17 +538,19 @@ class PetWindow(QWidget):
         city, ok = QInputDialog.getText(
             self,
             "设置城市",
-            "输入城市名:",
+            "输入城市名（中文或拼音/英文均可）:",
             QLineEdit.EchoMode.Normal,
-            self.cfg.get("city", "汕头")
+            self.cfg.get("city", DEFAULT_CITY)
         )
 
         print("输入框结果:", city, ok)
 
         if ok and city.strip():
-            self.cfg["city"] = city.strip()
-            print("cfg现在:", self.cfg["city"])
-            self.say(f"城市已设置为{city}")
+            name = city.strip()
+            self.cfg["city"] = name
+            self.cfg["city_query"] = CITY_MAP.get(name, name)
+            print("cfg现在:", self.cfg["city"], "->", self.cfg["city_query"])
+            self.say(f"城市已设置为{name}")
 
     def __init__(self):
         self.cfg = load_json(CONFIG_PATH, {
@@ -360,8 +562,14 @@ class PetWindow(QWidget):
             "x": None,
             "y": None,
             "ds_api_key": "",
-            "city": "汕头"
-    })
+            "city": DEFAULT_CITY,
+            "city_query": CITY_MAP.get(DEFAULT_CITY, DEFAULT_CITY),
+            "mood": MOOD_DEFAULT,
+            "pomodoro_min": POMODORO_WORK_MIN,
+            "break_min": POMODORO_BREAK_MIN,
+            "drink_remind": True,
+            "hourly_chime": True,
+        })
         
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         if self.cfg.get("topmost", True):
@@ -421,7 +629,18 @@ class PetWindow(QWidget):
         
         # 聊天暂停标志
         self.chat_paused = False
-        
+
+        # 心情值
+        self.mood = clamp_mood(int(self.cfg.get("mood", MOOD_DEFAULT)))
+        self.last_interaction_t = self.t * TICK   # 上次互动时刻(ms)
+        self.last_mood_tick_t = self.t * TICK     # 上次心情结算时刻(ms)
+
+        # 番茄钟 / 喝水 / 整点报时
+        self.pomodoro_state = None   # None | "work" | "break"
+        self.pomodoro_end_t = 0      # 结束时刻(ms)
+        self.last_drink_t = self.t * TICK
+        self.last_hour_reported = -1
+
         # 功能列表
         self.function_panel = FunctionPanel(self)
         self.food_panel = FoodPanel(self.on_food)
@@ -456,13 +675,21 @@ class PetWindow(QWidget):
         if self.cfg.get("passthrough", False):
             self._apply_passthrough(True)
 
+        # 全局快捷键：需要真实窗口句柄，放在 show() 之后
+        self._hwnd = int(self.winId())
+        ok = register_pet_hotkeys(self._hwnd)
+        if ok:
+            print("[hotkey] 已注册:", ", ".join(ok))
+        else:
+            print("[hotkey] 未注册任何快捷键（可能与其他程序冲突）")
+
     # ---------- AI 方法 ----------
     def _call_ds(self, user_msg):
         if self.ds_busy:
             self.say("等等，上一句还没回完呢")
             return
         
-        key = self.cfg.get("ds_api_key", "")
+        key = resolve_api_key(self.cfg)
         if not key:
             self.say("请先在右键菜单里设置 DeepSeek Key！")
             return
@@ -498,6 +725,7 @@ class PetWindow(QWidget):
                     if len(self.chat_history) > self.max_history:
                         self.chat_history = self.chat_history[-self.max_history:]
                     self._queue_say(reply)
+                    self.bump_mood(MOOD_CHAT_BONUS)
                 else:
                     error_msg = resp.json().get("error", {}).get("message", str(resp.status_code))
                     self._queue_say(f"API错误: {error_msg[:12]}")
@@ -512,6 +740,121 @@ class PetWindow(QWidget):
                 self.ds_busy = False
         
         threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- 心情值 ----------
+    def bump_mood(self, delta):
+        """改变心情并 clamp 到 [0, 100]"""
+        self.mood = clamp_mood(self.mood + delta)
+
+    def touch(self):
+        """记录一次互动（喂食 / 聊天 / 点击 / 拖拽都算）"""
+        self.last_interaction_t = self.t * TICK
+
+    def show_mood(self):
+        _thr, name, _daily, _react = get_mood_level(self.mood)
+        self.say(f"心情 {self.mood}/100，{name}～")
+
+    def _tick_mood(self, now_ms):
+        """每 MOOD_TICK_MS 结算一次：超过 MOOD_IDLE_MS 没互动就掉心情"""
+        if now_ms - self.last_mood_tick_t < MOOD_TICK_MS:
+            return
+        self.last_mood_tick_t = now_ms
+        if now_ms - self.last_interaction_t > MOOD_IDLE_MS:
+            self.mood = clamp_mood(self.mood - MOOD_IDLE_PENALTY)
+            if random.random() < 0.25:
+                _thr, _name, daily, _react = get_mood_level(self.mood)
+                if daily:
+                    self.say(random.choice(daily))
+
+    # ---------- 番茄钟 / 喝水 / 整点报时 ----------
+    def start_pomodoro(self, minutes=None):
+        if minutes is None:
+            minutes = int(self.cfg.get("pomodoro_min", POMODORO_WORK_MIN))
+        self.pomodoro_state = "work"
+        self.pomodoro_end_t = self.t * TICK + minutes * 60 * 1000
+        self.touch()
+        self.say(random.choice(POMODORO_START_LINES))
+
+    def start_break(self, minutes=None):
+        """手动开始一段休息"""
+        if minutes is None:
+            minutes = int(self.cfg.get("break_min", POMODORO_BREAK_MIN))
+        self.pomodoro_state = "break"
+        self.pomodoro_end_t = self.t * TICK + minutes * 60 * 1000
+        self.touch()
+        self.say(f"休息 {minutes} 分钟，喝口水～")
+
+    def stop_pomodoro(self):
+        if self.pomodoro_state:
+            self.pomodoro_state = None
+            self.pomodoro_end_t = 0
+            self.say("番茄钟取消了～")
+
+    def set_drink_remind(self, on):
+        self.cfg["drink_remind"] = bool(on)
+        self.last_drink_t = self.t * TICK   # 开关时重置计时，避免立刻弹提醒
+        self.say("喝水提醒已开启～" if on else "喝水提醒已关闭")
+
+    def set_hourly_chime(self, on):
+        self.cfg["hourly_chime"] = bool(on)
+        self.say("整点报时已开启～" if on else "整点报时已关闭")
+
+    def pomodoro_remain_text(self):
+        """返回剩余时间文本，如「专注 24:31」；未运行返回 None"""
+        if not self.pomodoro_state:
+            return None
+        left = max(0, self.pomodoro_end_t - self.t * TICK)
+        m, s = int(left // 60000), int(left // 1000 % 60)
+        return f"{'专注' if self.pomodoro_state == 'work' else '休息'} {m:02d}:{s:02d}"
+
+    def _tick_reminders(self, now_ms):
+        # 番茄钟：专注结束自动进入休息，休息结束回到空闲
+        if self.pomodoro_state and now_ms >= self.pomodoro_end_t:
+            if self.pomodoro_state == "work":
+                self.say(random.choice(POMODORO_DONE_LINES))
+                self.pomodoro_state = "break"
+                self.pomodoro_end_t = now_ms + int(
+                    self.cfg.get("break_min", POMODORO_BREAK_MIN)) * 60 * 1000
+            else:
+                self.say(random.choice(POMODORO_BREAK_DONE_LINES))
+                self.pomodoro_state = None
+                self.pomodoro_end_t = 0
+
+        # 喝水提醒
+        if self.cfg.get("drink_remind", True):
+            interval = int(self.cfg.get("drink_interval_min", DRINK_INTERVAL_MIN)) * 60 * 1000
+            if now_ms - self.last_drink_t >= interval:
+                self.last_drink_t = now_ms
+                self.say(random.choice(DRINK_LINES))
+                self.bump_mood(1)
+
+        # 整点报时
+        if self.cfg.get("hourly_chime", True):
+            hour = datetime.datetime.now().hour
+            if hour != self.last_hour_reported:
+                if self.last_hour_reported != -1:
+                    self.say(random.choice(HOUR_LINES_TPL).format(h=hour))
+                self.last_hour_reported = hour
+
+    # ---------- 全局快捷键 ----------
+    def nativeEvent(self, eventType, message):
+        """接收 Windows 原生消息，处理全局快捷键 WM_HOTKEY"""
+        try:
+            if eventType in ("windows_generic_MSG", "windows_dispatcher_MSG"):
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == WM_HOTKEY:
+                    hid = msg.wParam
+                    if hid == _HOTKEY_ID_TOGGLE:
+                        self.toggle_visible()
+                    elif hid == _HOTKEY_ID_SPEAK:
+                        _thr, _name, daily, _react = get_mood_level(self.mood)
+                        self.say(random.choice(daily) if daily else random.choice(LINES))
+                    elif hid == _HOTKEY_ID_QUIT:
+                        self.quit_app()
+                    return True, 0
+        except Exception as e:
+            print("nativeEvent 错误:", e)
+        return super().nativeEvent(eventType, message)
 
     # ---------- 绘制 ----------
     def paintEvent(self, _):
@@ -634,15 +977,19 @@ class PetWindow(QWidget):
             self.action_t = max(0.0, self.action_t - 0.03)
             if self.action_t == 0:
                 self.action = None
-        
+
+        # 心情 / 番茄钟 / 喝水 / 整点报时——即便在聊天暂停期间也要继续工作
+        now_ms = self.t * TICK
+        self._tick_mood(now_ms)
+        self._tick_reminders(now_ms)
+
         if self.chat_paused:
             self.update()
             return
-        
+
         if self.dragging:
             self.update()
             return
-        now_ms = self.t * TICK
 
         if self.mode == "follow":
             cursor = self.cursor().pos()
@@ -704,10 +1051,11 @@ class PetWindow(QWidget):
             elif pick < 0.9:
                 if self.t - self.last_speak_tick >= 1500:
                     self.last_speak_tick = self.t
+                    _thr, _name, daily, _react = get_mood_level(self.mood)
                     if pick < 0.82:
                         self.say(random.choice(INNER_LINES), inner=True)
                     else:
-                        self.say(random.choice(LINES))
+                        self.say(random.choice(daily))
 
     def _queue_say(self, text):
         """后台线程调用：只入队，由主线程 tick 统一弹出显示（线程安全）"""
@@ -766,6 +1114,7 @@ class PetWindow(QWidget):
             self.function_panel.hide()
             self.chat_dialog.hide()
             self.chat_paused = True
+            self.touch()
 
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.MouseButton.LeftButton and self.drag_start_pos is not None:
@@ -792,8 +1141,12 @@ class PetWindow(QWidget):
                 if random.random() < 0.5:
                     self.say(random.choice(DRAG_LINES))
                 self.chat_paused = False
+                self.touch()
+                self.bump_mood(MOOD_PET_BONUS)
             else:
                 self._click_timer.start(280)  # 等双击判定；单击则回嘴+弹聊天面板
+                self.touch()
+                self.bump_mood(MOOD_PET_BONUS)
             self.last_press_pos = None
             self.drag_start_pos = None
 
@@ -808,6 +1161,8 @@ class PetWindow(QWidget):
             self.jump_t = 1.0
         if random.random() < 0.6:
             self.say(random.choice(REACT_LINES))
+        self.touch()
+        self.bump_mood(MOOD_PET_BONUS)
         panel = self.function_panel
         panel.popup_at(self.x() + self.width() / 2 - panel.width() / 2,
                        self.y() - panel.height() - 10)
@@ -818,9 +1173,11 @@ class PetWindow(QWidget):
         self.jump_t = 0.6
         lines = FOOD_LINES.get(food, ["好吃！"])
         self.say(random.choice(lines))
+        self.touch()
+        self.bump_mood(MOOD_FOOD_BONUS)
 
     def _show_chat_dialog(self):
-        key = self.cfg.get("ds_api_key", "")
+        key = resolve_api_key(self.cfg)
         if not key:
             self.say("请先在右键菜单里设置 DeepSeek Key！")
             self.chat_paused = False
@@ -843,10 +1200,12 @@ class PetWindow(QWidget):
 
     def _get_weather(self):
         try:
-            city = self.cfg.get("city", "汕头")
-            print("当前城市:", city)
+            city = self.cfg.get("city", DEFAULT_CITY)
+            # 中文城市名走映射表转成 wttr.in 能识别的英文名
+            query = self.cfg.get("city_query") or CITY_MAP.get(city, city)
+            print("当前城市:", city, "查询名:", query)
 
-            url = f"https://wttr.in/{city}?format=j1"
+            url = f"https://wttr.in/{query}?format=j1"
 
             r = requests.get(
                 url,
@@ -902,6 +1261,34 @@ class PetWindow(QWidget):
             a.triggered.connect(lambda _, v=mult: self.set_size(v))
         m.addAction("设置 Key", self._set_key_dialog)
         m.addAction("查看天气", self._get_weather)
+        m.addAction("设置城市", self._set_city_dialog)
+        m.addSeparator()
+
+        # 心情
+        _thr, mood_name, _daily, _react = get_mood_level(self.mood)
+        m.addAction(f"查看心情（{self.mood} · {mood_name}）", self.show_mood)
+
+        # 番茄钟 / 喝水 / 整点报时
+        rem = self.pomodoro_remain_text()
+        pomo_menu = m.addMenu(f"番茄钟{'（' + rem + '）' if rem else ''}")
+        pomo_menu.addAction(
+            f"开始专注 {int(self.cfg.get('pomodoro_min', POMODORO_WORK_MIN))} 分钟",
+            lambda: self.start_pomodoro())
+        pomo_menu.addAction(
+            f"休息 {int(self.cfg.get('break_min', POMODORO_BREAK_MIN))} 分钟",
+            lambda: self.start_break())
+        pomo_menu.addAction("停止计时", self.stop_pomodoro)
+
+        da = m.addAction("喝水提醒")
+        da.setCheckable(True)
+        da.setChecked(self.cfg.get("drink_remind", True))
+        da.triggered.connect(lambda on: self.set_drink_remind(on))
+
+        ha = m.addAction("整点报时")
+        ha.setCheckable(True)
+        ha.setChecked(self.cfg.get("hourly_chime", True))
+        ha.triggered.connect(lambda on: self.set_hourly_chime(on))
+
         m.addSeparator()
         m.addAction("显示/隐藏", self.toggle_visible)
         m.addAction("回到屏幕内", self.snap_into_screen)
@@ -922,18 +1309,24 @@ class PetWindow(QWidget):
         return m
 
     def _set_key_dialog(self):
+        current = resolve_api_key(self.cfg)
+        masked = (current[:4] + "…" + current[-4:]) if len(current) > 8 else (current or "")
         key, ok = QInputDialog.getText(
-            self, 
-            "设置 DeepSeek Key", 
-            "输入你的 API Key（从 platform.deepseek.com 获取）:",
+            self,
+            "设置 DeepSeek Key",
+            f"输入你的 API Key（写入 .env，优先于系统环境变量）\n当前: {masked or '未设置'}",
             QLineEdit.EchoMode.Normal,
-            self.cfg.get("ds_api_key", "")
+            ""
         )
-        if ok and key.strip():
-            self.cfg["ds_api_key"] = key.strip()
-            self.say("Key 设置成功！")
-        elif ok and not key.strip():
+        if not ok:
+            return
+        if not key.strip():
             self.say("Key 不能为空")
+            return
+        if save_api_key_to_env(key.strip()):
+            self.say("Key 已写入 .env，安全保存！")
+        else:
+            self.say(".env 写入失败，请检查权限")
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Context:
@@ -1018,8 +1411,16 @@ class PetWindow(QWidget):
 
     def quit_app(self):
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
+        self.cfg["mood"] = self.mood
+        # 永远不要把 API Key 写进 config.json（避免明文残留）
+        self.cfg.pop("ds_api_key", None)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+        # 注销全局快捷键
+        try:
+            unregister_pet_hotkeys(self._hwnd)
+        except Exception as e:
+            print("快捷键注销失败:", e)
         self.tray.hide()
         QApplication.quit()
 
